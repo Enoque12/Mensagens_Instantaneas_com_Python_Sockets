@@ -1,122 +1,143 @@
-"""
-import socket
-
-HOST = '127.0.0.1'   # localhost
-PORT = 5000          # porta qualquer acima de 1024
-
-# cria o socket TCP
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_socket.bind((HOST, PORT))
-server_socket.listen(1)
-
-print(f"Servidor iniciado em {HOST}:{PORT}, aguardando conexão...")
-
-conn, addr = server_socket.accept()
-print(f"Conectado por {addr}")
-
-while True:
-    # recebe mensagem do cliente
-    data = conn.recv(1024).decode()
-    if not data or data.lower() == "sair":
-        print("Cliente desconectou.")
-        break
-    print("Cliente:", data)
-
-    # envia resposta
-    resposta = input("Servidor > ")
-    conn.sendall(resposta.encode())
-    if resposta.lower() == "sair":
-        break
-
-conn.close()
-server_socket.close()
-"""
-"""
+# Servidor.py
 import socket
 import threading
+import mysql.connector
+import json
+from datetime import datetime
 
-HOST = '127.0.0.1'
-PORT = 5000
+class Servidor:
+    def __init__(self, host="localhost", port=5000):
+        self.host = host
+        self.port = port
+        self.clientes = {}          # mapa usuario -> conn
+        self.lock = threading.Lock()
 
-# função para atender cada cliente
-def handle_client(conn, addr):
-    print(f"[NOVA CONEXÃO] Cliente {addr} conectado.")
-    while True:
+        # Conexão com MySQL (ajusta credenciais)
+        self.conn_db = mysql.connector.connect(
+            host="localhost",
+            user="root",
+            password="",
+            database="chat_app"
+        )
+        self.cursor = self.conn_db.cursor()
+        self.criar_tabela()
+
+        # Socket
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind((self.host, self.port))
+        self.sock.listen(5)
+        print(f"✅ Servidor rodando em {self.host}:{self.port} (chat geral)")
+
+    def criar_tabela(self):
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS mensagens (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                remetente VARCHAR(255),
+                mensagem TEXT,
+                timetamps TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self.conn_db.commit()
+
+    def salvar_mensagem(self, remetente, mensagem):
+        sql = "INSERT INTO mensagens (remetente, mensagem) VALUES (%s, %s)"
+        self.cursor.execute(sql, (remetente, mensagem))
+        self.conn_db.commit()
+
+    def obter_historico(self):
+        sql = "SELECT remetente, mensagem, timetamps FROM mensagens ORDER BY timetamps ASC"
+        self.cursor.execute(sql)
+        rows = self.cursor.fetchall()
+        # retorna lista de dicts para facilitar consumo
+        historico = [
+            {"remetente": r[0], "mensagem": r[1], "timestamp": str(r[2])}
+            for r in rows
+        ]
+        return historico
+
+    def _send_json(self, conn, obj):
         try:
-            data = conn.recv(1024).decode()
-            if not data or data.lower() == "sair":
-                print(f"[DESCONECTADO] Cliente {addr}")
-                break
-            print(f"Cliente {addr}: {data}")
+            raw = json.dumps(obj, default=str) + "\n"
+            conn.send(raw.encode())
+        except Exception:
+            # remova cliente se não responder
+            with self.lock:
+                to_remove = None
+                for user, c in list(self.clientes.items()):
+                    if c is conn:
+                        to_remove = user
+                        break
+                if to_remove:
+                    del self.clientes[to_remove]
+                    print(f"⚠️ Removido cliente {to_remove} por erro de envio")
 
-            resposta = input("Servidor > ")
-            conn.sendall(resposta.encode())
-            if resposta.lower() == "sair":
-                break
-        except:
-            print(f"[ERRO] Conexão perdida com {addr}")
-            break
-    conn.close()
+    def broadcast(self, remetente, mensagem):
+        data = {"acao": "mensagem", "remetente": remetente, "mensagem": mensagem, "timestamp": str(datetime.now())}
+        with self.lock:
+            for nome, conn in list(self.clientes.items()):
+                if nome == remetente:
+                    continue  # opcional: não reenvia ao dono
+                self._send_json(conn, data)
 
-def start_server():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind((HOST, PORT))
-    server_socket.listen()
-    print(f"Servidor rodando em {HOST}:{PORT}")
+    def handle_client(self, conn, addr):
+        buffer = ""
+        usuario = None
+        try:
+            while True:
+                chunk = conn.recv(4096).decode()
+                if not chunk:
+                    break
+                buffer += chunk
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError as e:
+                        print("JSON Decode Error:", e, "line:", line)
+                        continue
 
-    while True:
-        conn, addr = server_socket.accept()
-        thread = threading.Thread(target=handle_client, args=(conn, addr))
-        thread.start()
-        print(f"[ATIVOS] Clientes conectados: {threading.active_count() - 1}")
+                    acao = msg.get("acao")
+                    if acao == "conectar":
+                        usuario = msg.get("usuario")
+                        if not usuario:
+                            continue
+                        with self.lock:
+                            self.clientes[usuario] = conn
+                        print(f"🔗 {usuario} conectado.")
+                    elif acao == "historico":
+                        hist = self.obter_historico()
+                        resp = {"acao": "historico", "data": hist}
+                        self._send_json(conn, resp)
+                    elif acao == "enviar":
+                        remetente = msg.get("remetente")
+                        texto = msg.get("mensagem")
+                        if remetente and texto is not None:
+                            self.salvar_mensagem(remetente, texto)
+                            self.broadcast(remetente, texto)
+                    else:
+                        print("⚠️ Ação desconhecida recebida:", acao)
+        except (ConnectionResetError, ConnectionAbortedError):
+            print(f"🔌 {usuario if usuario else addr} se desconectou.")
+        except Exception as e:
+            print("❌ Erro no handle_client:", e)
+        finally:
+            conn.close()
+            if usuario:
+                with self.lock:
+                    if usuario in self.clientes and self.clientes[usuario] is conn:
+                        del self.clientes[usuario]
+                print(f"🛑 Conexão com {usuario} encerrada.")
+
+    def run(self):
+        while True:
+            conn, addr = self.sock.accept()
+            # não faz recv() aqui — a thread fará o handshake
+            threading.Thread(target=self.handle_client, args=(conn, addr), daemon=True).start()
+
 
 if __name__ == "__main__":
-    start_server()
-"""
-
-import socket
-import threading
-
-HOST = '192.168.104.7'
-PORT = 12345
-
-clientes = []
-
-def handle_client(conn, nome):
-    while True:
-        try:
-            data = conn.recv(1024)
-            if not data:
-                break
-            mensagem = f"{data.decode()}"
-            print(mensagem)
-
-            # envia a mensagem para o outro cliente
-            for cliente in clientes:
-                if cliente != conn:
-                    cliente.sendall(mensagem.encode())
-        except:
-            break
-
-    print(f"{nome} desconectou.")
-    clientes.remove(conn)
-    conn.close()
-
-def start_server():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind((HOST, PORT))
-    server_socket.listen(2)  # limite: 2 clientes
-    print("Servidor de chat aguardando 2 clientes...")
-
-    nomes = ["Cliente A", "Cliente B"]
-
-    while len(clientes) < 2:
-        conn, addr = server_socket.accept()
-        clientes.append(conn)
-        nome = nomes[len(clientes) - 1]
-        print(f"{nome} conectado de {addr}")
-        thread = threading.Thread(target=handle_client, args=(conn, nome))
-        thread.start()
-
-if __name__ == "__main__":
-    start_server()
+    servidor = Servidor()
+    servidor.run()
